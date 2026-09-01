@@ -47,7 +47,12 @@
 #include <unordered_map>
 #include <atomic>
 #include <thread>
+#include <functional>
 #include <any>
+
+#ifdef ENABLE_ELUNA
+#include "ElunaMgr.h"
+#endif
 
 class Object;
 class WorldSession;
@@ -56,6 +61,14 @@ class SqlResultQueue;
 class QueryResult;
 class World;
 class ChannelBroadcaster;
+// forward-decl so World::GetLFGQueue() return type compiles.
+class LFGQueue;
+#ifdef ENABLE_ELUNA
+class Eluna;
+#endif
+// forward-decl GraveYardData (defined in ObjectMgr.h)
+// so World::WorldGraveyardManagerStub method signature parses without needing the full type.
+struct GraveYardData;
 namespace DiscordBot
 {
     class Bot;
@@ -421,6 +434,10 @@ enum eConfigUInt32Values
     CONFIG_UINT32_MAX_GOLD_TRANSFERRED,
     CONFIG_UINT32_MAX_ITEM_STACK_TRANSFERRED,
     CONFIG_UINT32_DYNAMIC_SCALING_POP,
+    CONFIG_UINT32_LFT_BOTFILL_DELAY,
+    CONFIG_UINT32_LFT_BOTFILL_LEVEL_BELOW,
+    CONFIG_UINT32_LFT_BOTFILL_LEVEL_BELOW_HEALER,
+    CONFIG_UINT32_LFT_BOTFILL_LEVEL_ABOVE,
     CONFIG_UINT32_VALUE_COUNT
 };
 
@@ -535,6 +552,15 @@ enum eConfigFloatValues
     CONFIG_FLOAT_SUSPICIOUS_MOVEMENTSPEED_REPORT_THRESHOLD,
     CONFIG_FLOAT_MAX_FACTION_IMBALANCE,
     CONFIG_FLOAT_OPEN_WORLD_HONOR_MULTIPLIER,
+    CONFIG_FLOAT_LEECH_AMOUNT,
+    CONFIG_FLOAT_SCALAR_MIN_5MAN_HP,
+    CONFIG_FLOAT_SCALAR_MIN_5MAN_DMG,
+    CONFIG_FLOAT_SCALAR_MIN_10MAN_HP,
+    CONFIG_FLOAT_SCALAR_MIN_10MAN_DMG,
+    CONFIG_FLOAT_SCALAR_MIN_20MAN_HP,
+    CONFIG_FLOAT_SCALAR_MIN_20MAN_DMG,
+    CONFIG_FLOAT_SCALAR_MIN_40MAN_HP,
+    CONFIG_FLOAT_SCALAR_MIN_40MAN_DMG,
     CONFIG_FLOAT_VALUE_COUNT
 };
 
@@ -702,10 +728,28 @@ enum eConfigBoolValues
     CONFIG_BOOL_ENABLE_DYNAMIC_VISIBILITIES,
     CONFIG_BOOL_PRIORITY_QUEUE_ENABLE_IP_PENALTY,
     CONFIG_BOOL_LOAD_LOCALES,
+    CONFIG_BOOL_LOAD_SPELLS_FROM_SQL,
     CONFIG_BOOL_ENABLE_FACTION_BALANCE,
     CONFIG_BOOL_BLOCK_ALL_HANZI,
     CONFIG_BOOL_HOLIDAY_EVENT,
     CONFIG_BOOL_PERFORMANCE_ENABLE,
+    CONFIG_BOOL_LEECH_ENABLE,
+    // Leech restrictions: without them the leech applies to EVERY player,
+    // including the ~1000 random bots, and in PvP too, which skews fights
+    // server wide. See Unit::DealDamage.
+    CONFIG_BOOL_LEECH_PVE_ONLY,
+    CONFIG_BOOL_LEECH_REAL_PLAYERS_ONLY,
+    CONFIG_BOOL_LEECH_SOLO_ONLY,
+    CONFIG_BOOL_LEECH_DUNGEON_ONLY,
+    // Solo dungeon resurrection, see Player::RepopAtGraveyard
+    CONFIG_BOOL_SOLO_DUNGEON_REPOP_ALIVE,
+    // Dungeon finder: fill a waiting player's group with random bots.
+    // See LFT/LFTBotFill.cpp
+    CONFIG_BOOL_LFT_BOTFILL_ENABLE,
+    CONFIG_BOOL_AUTOSCALER_ENABLE,
+    // Remove navmesh tiles again at runtime. Off by default, see
+    // MMapManager::unloadMap.
+    CONFIG_BOOL_MMAP_TILE_UNLOAD,
     CONFIG_BOOL_VALUE_COUNT
 };
 
@@ -885,6 +929,31 @@ class World
 
         World();
         ~World();
+
+        // bot calls sWorld.GetLFGQueue() and sWorld.GetCurrentMSTime().
+        // Penqle's LFGQueue lives in LFG/LFGMgr.h. Forward to sLFGMgr.
+        // Forward-declare LFGQueue at this scope to avoid requiring full LFGMgr.h include.
+        class LFGQueue& GetLFGQueue();
+        // The one call the core still makes into the bot module: it registers the
+        // module hook objects. The per-tick driver is WorldScript::OnUpdate and the
+        // post-load work is WorldScript::OnStartup, both fired from World.cpp.
+        void InitPlayerbotsAtStartup();
+        uint32 GetCurrentMSTime() const;
+        // GetMaxDiff: cmangos exposes max diff for performance dashboard. Stub returns 0.
+        uint32 GetMaxDiff() const { return 0; }
+        // GetCurrentDiff: cmangos exposes current frame diff. Stub returns 100ms.
+        uint32 GetCurrentDiff() const { return 100; }
+        // GetGraveyardManager: cmangos has it on World too. Stub returns a manager-stub.
+        // Templated GetGraveyardMap() defers instantiation of std::map<uint32, GraveYardData> to call site,
+        // so World.h consumers don't need the full GraveYardData definition.
+        struct WorldGraveyardManagerStub {
+            template<typename T = ::GraveYardData>
+            std::map<uint32, T> const& GetGraveyardMap() const {
+                static std::map<uint32, T> s;
+                return s;
+            }
+        };
+        WorldGraveyardManagerStub& GetGraveyardManager();
 
 		// basically a destructor
 		void InternalShutdown();
@@ -1252,6 +1321,10 @@ class World
         std::atomic_uint64_t m_packetsCount[NUM_MSG_TYPES] = {};
         std::atomic_uint64_t m_packetsSize[NUM_MSG_TYPES] = {};
 
+#ifdef ENABLE_ELUNA
+        Eluna* GetEluna() const { return sElunaMgr->Get(m_elunaInfo); }
+#endif
+
     protected:
         void _UpdateGameTime();
         // callback for UpdateRealmCharacters
@@ -1281,6 +1354,36 @@ class World
         uint32 m_ShutdownMask = 0;
 
         uint32 m_MaintenanceTimeChecker = 0;
+
+        // custom: AutoWorldBuff (2026-07-28, see World.cpp) - one independent
+        // timer per buff so Zandalar/Warchief's Blessing/Dragonslayer don't
+        // all become available at the same instant. firstSinceRestart picks
+        // a short interval for the very first roll after a (re)start so
+        // frequent restarts don't each cost a full re-roll of the long
+        // interval; later rolls use the normal, longer interval.
+        struct WorldBuffTimerState
+        {
+            uint32 timer = 0;
+            uint32 warningMs = 0;
+            bool warned = false;
+            bool firstSinceRestart = true;
+        };
+        WorldBuffTimerState m_zandalarBuffTimer;
+        WorldBuffTimerState m_warchiefBuffTimer;
+        WorldBuffTimerState m_dragonslayerBuffTimer;
+        void UpdateWorldBuffTimer(uint32 diff, WorldBuffTimerState& state, uint32 spellId,
+            std::string const& announceLabel, std::function<bool(Player*)> const& eligible);
+
+        // custom: AutoDonationPoints - time online in ms per account since the
+        // last award, so that different login times need not be synchronised
+        // onto one common tick: every account gets its own full hour.
+        //
+        std::unordered_map<uint32 /*accountId*/, uint32 /*accumulatedMs*/> m_donationPointAccumulatorMs;
+        // Time until the next periodic persist of the accumulators above into
+        // `donation_point_progress` in the login database - see World.cpp.
+        // Without persistence the progress restarted from zero after every
+        // server restart.
+        uint32 m_donationPointFlushTimer = 0;
 
         uint32 m_minChatLevel = 0;
         time_t m_startTime;
@@ -1387,6 +1490,10 @@ class World
         std::unique_ptr<ChannelBroadcaster> m_ChannelBroadcaster;
 
         std::unique_ptr<ThreadPool> m_updateThreads;
+
+#ifdef ENABLE_ELUNA
+        ElunaInfo m_elunaInfo;
+#endif
 };
 
 extern uint32 realmID;

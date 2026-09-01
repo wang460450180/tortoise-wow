@@ -57,6 +57,13 @@
 #include "MovementBroadcaster.h"
 #include "PlayerBroadcaster.h"
 
+#include "Autoscaling/AutoScaler.hpp"
+
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#include "ElunaEventMgr.h"
+#endif
+
 ////////////////////////////////////////////////////////////
 // Methods of class MovementInfo
 
@@ -314,6 +321,10 @@ void Object::SendCreateUpdateToPlayer(Player* player)
     BuildCreateUpdateBlockForPlayer(&upd, player);
     upd.Send(player->GetSession());
 }
+
+// cmangos compat: vendored bot module calls IsFriend/IsEnemy on WorldObject*.
+bool WorldObject::IsFriend(WorldObject const* target) const { return target && IsFriendlyTo(target); }
+bool WorldObject::IsEnemy(WorldObject const* target) const { return target && IsHostileTo(target); }
 
 void WorldObject::DirectSendPublicValueUpdate(uint32 index, uint32 count)
 {
@@ -2035,6 +2046,9 @@ void WorldObject::SetMap(Map * map)
     m_mapId = map->GetId();
     m_InstanceId = map->GetInstanceId();
 
+#ifdef ENABLE_ELUNA
+    elunaMapEvents.reset();
+#endif
 
     // Order is important, must be done after m_currMap is set
     SetZoneScript();
@@ -2182,6 +2196,15 @@ Creature *Map::SummonCreature(uint32 entry, float x, float y, float z, float ang
     if (pCreature->IsLinkingEventTrigger())
         GetCreatureLinkingHolder()->DoCreatureLinkingEvent(LINKING_EVENT_RESPAWN, pCreature);
 
+    // Scaling: apply to all dungeon/raid instances
+    if (pCreature->GetMap()->IsDungeon())
+    {
+        uint32 playerCount = pCreature->GetMap()->GetPlayersCountExceptGMs();
+        uint32 maxCount = ((DungeonMap*)pCreature->GetMap())->GetMaxPlayers();
+        if (playerCount > 0)
+            sAutoScaler->ScaleCreature(pCreature, playerCount, maxCount, pCreature->GetMap());
+    }
+
     // return the creature therewith the summoner has access to it
     return pCreature;
 }
@@ -2232,12 +2255,27 @@ Creature* WorldObject::SummonCreature(uint32 id, float x, float y, float z, floa
     if (GetTypeId() == TYPEID_UNIT && ((Creature*)this)->AI())
         ((Creature*)this)->AI()->JustSummoned(pCreature);
 
+#ifdef ENABLE_ELUNA
+    if (Unit* summoner = ToUnit())
+        if (Eluna* e = GetEluna())
+            e->OnSummoned(pCreature, summoner);
+#endif
+
     // Creature Linking, Initial load is handled like respawn
     if (pCreature->IsLinkingEventTrigger())
         GetMap()->GetCreatureLinkingHolder()->DoCreatureLinkingEvent(LINKING_EVENT_RESPAWN, pCreature);
 
     pCreature->SetWorldMask(GetWorldMask());
     // return the creature therewith the summoner has access to it
+
+    // Scaling: apply to all dungeon/raid instances
+    if (pCreature->GetMap()->IsDungeon())
+    {
+        uint32 playerCount = pCreature->GetMap()->GetPlayersCountExceptGMs();
+        uint32 maxCount = ((DungeonMap*)pCreature->GetMap())->GetMaxPlayers();
+        if (playerCount > 0)
+            sAutoScaler->ScaleCreature(pCreature, playerCount, maxCount, pCreature->GetMap());
+    }
 
     if (attach)
         IncrementSummonCounter();
@@ -3807,7 +3845,7 @@ float WorldObject::MeleeSpellMissChance(Unit* pVictim, WeaponAttackType attType,
                     hitChance += owner->m_modSpellHitChance * aura->GetModifier()->m_amount / 100.0f;
             }
         }
-    } 
+    }
 
     // There is some code in 1.12 that explicitly adds a modifier that causes the first 1% of +hit gained from
     // talents or gear to be ignored against monsters with more than 10 Defense Skill above the attacking players Weapon Skill.
@@ -5251,6 +5289,30 @@ bool WorldObject::CheckAndIncreaseCastCounter()
     ++m_castCounter;
     return true;
 }
+
+#ifdef ENABLE_ELUNA
+Eluna* WorldObject::GetEluna() const
+{
+    return IsInWorld() ? GetMap()->GetEluna() : nullptr;
+}
+
+ElunaEventProcessor* WorldObject::GetElunaEvents(int32 mapId)
+{
+    Eluna* eluna = mapId == -1 ? sWorld.GetEluna() : GetEluna();
+    if (!eluna || !eluna->eventMgr)
+        return nullptr;
+
+    EventMgr* eventMgr = eluna->eventMgr.get();
+    std::unique_ptr<ElunaProcessorInfo>& info = mapId == -1 ? elunaWorldEvents : elunaMapEvents;
+    if (!info)
+    {
+        uint64 id = eventMgr->CreateObjectProcessor(this);
+        info = std::make_unique<ElunaProcessorInfo>(eventMgr, id);
+    }
+
+    return eventMgr->GetObjectProcessor(info->GetProcessorId());
+}
+#endif
 
 void WorldObject::MoveChannelledSpellWithCastTime(Spell* pSpell)
 {

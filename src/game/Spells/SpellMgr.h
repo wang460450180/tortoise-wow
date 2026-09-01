@@ -543,6 +543,9 @@ class SpellMgr
             return 0;
         }
 
+        // cmangos uses IsSpellHigherRankOfSpell (longer name).
+        bool IsSpellHigherRankOfSpell(uint32 spell1, uint32 spell2) const { return IsHighRankOfSpell(spell1, spell2); }
+
         bool IsHighRankOfSpell(uint32 spell1,uint32 spell2) const
         {
             SpellChainMap::const_iterator itr = mSpellChains.find(spell1);
@@ -720,6 +723,8 @@ class SpellMgr
 
         // SpellEntry
         void LoadSpells();
+        void LoadSpellExtra();
+        void LoadSpellsFromSpellTemplate();
         void AssignInternalSpellFlags();
         SpellEntry const* GetSpellEntry(uint32 spellId) const { return spellId < GetMaxSpellId() ? mSpellEntryMap[spellId].get() : nullptr; }
         uint32 GetMaxSpellId() const { return mSpellEntryMap.size(); }
